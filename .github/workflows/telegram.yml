@@ -2,19 +2,140 @@ name: HRMO Telegram Relay
 
 on:
   workflow_dispatch:
-
   schedule:
     - cron: "*/5 * * * *"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: hrmo-telegram-relay
+  cancel-in-progress: false
+
 jobs:
-  telegram-relay:
+  send-notifications:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
-      - name: Get Pending Notifications
+      - name: Fetch pending HRMO notifications
+        env:
+          HRMO_URL: ${{ secrets.HRMO_URL }}
+          HRMO_SECRET_KEY: ${{ secrets.HRMO_SECRET_KEY }}
         run: |
-          curl "${{ secrets.HRMO_URL }}/index.php?api=telegram_queue&key=${{ secrets.HRMO_SECRET_KEY }}" -o queue.json
+          set -euo pipefail
 
-      - name: Display Queue
+          BASE_URL="${HRMO_URL%/}"
+          curl --fail --silent --show-error \
+            --get \
+            --data-urlencode "api=github_telegram_queue" \
+            --data-urlencode "key=${HRMO_SECRET_KEY}" \
+            "${BASE_URL}/index.php" \
+            -o queue.json
+
+          python3 -m json.tool queue.json
+
+      - name: Send queued messages to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HRMO_URL: ${{ secrets.HRMO_URL }}
+          HRMO_SECRET_KEY: ${{ secrets.HRMO_SECRET_KEY }}
         run: |
-          cat queue.json
+          python3 <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+          import urllib.error
+
+          with open("queue.json", "r", encoding="utf-8") as file:
+              payload = json.load(file)
+
+          if not payload.get("ok"):
+              raise SystemExit(
+                  "Queue API error: " + str(payload.get("message", "Unknown error"))
+              )
+
+          items = payload.get("items", [])
+          print(f"Pending queue items: {len(items)}")
+
+          if not items:
+              raise SystemExit(0)
+
+          bot_token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+          chat_id = os.environ["TELEGRAM_CHAT_ID"].strip()
+          base_url = os.environ["HRMO_URL"].rstrip("/")
+          relay_key = os.environ["HRMO_SECRET_KEY"]
+
+          def acknowledge(queue_id, result, error=""):
+              params = urllib.parse.urlencode({
+                  "api": "github_telegram_ack",
+                  "key": relay_key,
+                  "id": queue_id,
+                  "result": result,
+                  "error": error[:1500],
+              })
+              url = f"{base_url}/index.php?{params}"
+              with urllib.request.urlopen(url, timeout=30) as response:
+                  body = json.loads(response.read().decode("utf-8"))
+              if not body.get("ok"):
+                  raise RuntimeError(f"Acknowledge failed: {body}")
+
+          for item in items:
+              queue_id = int(item["id"])
+              message = str(item["message"])
+
+              telegram_url = (
+                  f"https://api.telegram.org/bot{bot_token}/sendMessage"
+              )
+
+              telegram_data = urllib.parse.urlencode({
+                  "chat_id": chat_id,
+                  "text": message,
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": "true",
+              }).encode("utf-8")
+
+              request = urllib.request.Request(
+                  telegram_url,
+                  data=telegram_data,
+                  method="POST",
+                  headers={
+                      "Content-Type": "application/x-www-form-urlencoded",
+                      "User-Agent": "JRMSU-HRMO-GitHub-Relay/1.0",
+                  },
+              )
+
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      telegram_result = json.loads(
+                          response.read().decode("utf-8")
+                      )
+
+                  if not telegram_result.get("ok"):
+                      error = str(
+                          telegram_result.get(
+                              "description",
+                              "Telegram returned an unsuccessful response",
+                          )
+                      )
+                      acknowledge(queue_id, "failed", error)
+                      print(f"Queue {queue_id} failed: {error}")
+                      continue
+
+                  acknowledge(queue_id, "sent")
+                  print(f"Queue {queue_id} sent successfully.")
+
+              except Exception as exc:
+                  error = f"{type(exc).__name__}: {exc}"
+                  try:
+                      acknowledge(queue_id, "failed", error)
+                  except Exception as ack_exc:
+                      print(
+                          f"Queue {queue_id}: Telegram error: {error}; "
+                          f"acknowledge error: {ack_exc}"
+                      )
+                  else:
+                      print(f"Queue {queue_id} failed: {error}")
+          PY
