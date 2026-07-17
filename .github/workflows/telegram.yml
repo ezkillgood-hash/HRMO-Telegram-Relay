@@ -18,7 +18,8 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Fetch pending HRMO notifications
+           - name: Fetch pending HRMO notifications
+        shell: bash
         env:
           HRMO_URL: ${{ secrets.HRMO_URL }}
           HRMO_SECRET_KEY: ${{ secrets.HRMO_SECRET_KEY }}
@@ -26,15 +27,30 @@ jobs:
           set -euo pipefail
 
           BASE_URL="${HRMO_URL%/}"
-          curl --fail --silent --show-error \
-            --get \
-            --data-urlencode "api=github_telegram_queue" \
-            --data-urlencode "key=${HRMO_SECRET_KEY}" \
-            "${BASE_URL}/index.php" \
-            -o queue.json
+          API_URL="${BASE_URL}/index.php?api=github_telegram_queue&key=${HRMO_SECRET_KEY}"
 
-          python3 -m json.tool queue.json
+          echo "Connecting to HRMO relay API..."
 
+          curl \
+            --http1.1 \
+            --ipv4 \
+            --location \
+            --retry 5 \
+            --retry-delay 5 \
+            --connect-timeout 30 \
+            --max-time 90 \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36" \
+            --header "Accept: application/json,text/plain,*/*" \
+            --header "Cache-Control: no-cache" \
+            --header "Referer: ${BASE_URL}/" \
+            --silent \
+            --show-error \
+            --fail-with-body \
+            "$API_URL" \
+            --output queue.json
+
+          echo "Server response:"
+          cat queue.json
       - name: Send queued messages to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
